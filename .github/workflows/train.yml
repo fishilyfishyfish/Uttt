@@ -1,0 +1,66 @@
+name: train
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: train
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: prepare
+        run: |
+          nproc
+          pip install --upgrade pip
+          pip install numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: gate
+        id: gate
+        run: |
+          if [ -f state/STOP ] || [ -f state/DONE ]; then
+            echo "run=no" >> $GITHUB_OUTPUT
+          else
+            echo "run=yes" >> $GITHUB_OUTPUT
+          fi
+
+      - name: train
+        if: steps.gate.outputs.run == 'yes'
+        run: python uttt.py --config config.json
+
+      - name: commit
+        if: always()
+        run: |
+          git config user.name "train-bot"
+          git config user.email "train-bot@users.noreply.github.com"
+          git add -A state/ || true
+          git diff --staged --quiet || git commit -m "train: progress"
+          git pull --rebase --autostash || true
+          git push || true
+
+      - name: queue next
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f state/STOP ] || [ -f state/DONE ]; then
+            echo "stopped"
+          else
+            gh workflow run train.yml --repo "$GITHUB_REPOSITORY"
+          fi
