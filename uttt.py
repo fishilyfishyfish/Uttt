@@ -295,9 +295,11 @@ def play_match(p_first, p_second):
 def self_play(net, cfg, rng):
     ev = Evaluator(net)
     m = MCTS(ev, cfg["sims"], cfg["c_puct"], cfg["dirichlet_alpha"], cfg["dirichlet_eps"], rng)
+    reuse = cfg.get("reuse_tree", True)
     s, trace, ply = start_state(), [], 0
     while True:
-        m.reset()
+        if not reuse:
+            m.reset()
         pi = m.run(s, add_noise=True)
         trace.append((s, pi.copy()))
         a = int(rng.choice(81, p=pi)) if ply < cfg["temp_moves"] else int(np.argmax(pi))
@@ -408,19 +410,31 @@ def svg(series):
     return "\n".join(o)
 
 
+def smooth(hist, key, w=20):
+    vals = [h.get(key) for h in hist]
+    out = []
+    for i in range(len(vals)):
+        seg = [v for v in vals[max(0, i - w + 1):i + 1] if v is not None]
+        out.append(sum(seg) / len(seg) if seg else None)
+    return out
+
+
 def write_report(hist):
     os.makedirs(STATE_DIR, exist_ok=True)
     pc = lambda v: "-" if v is None else f"{v*100:.0f}%"
     keys = [k for k in ("vs_anchor", "vs_heuristic", "vs_random", "vs_prev")
             if any(h.get(k) is not None for h in hist)]
     with open(f"{STATE_DIR}/chart.svg", "w") as f:
-        f.write(svg({k: [h.get(k) for h in hist] for k in keys}))
+        f.write(svg({k: smooth(hist, k) for k in keys}))      # 그래프는 20회차 이동평균
     last = hist[-1] if hist else {}
+    sm = {k: smooth(hist, k)[-1] if hist else None for k in ("vs_anchor", "vs_heuristic", "vs_random")}
+    early = {k: (smooth(hist, k)[min(39, len(hist) - 1)] if hist else None)
+             for k in ("vs_anchor", "vs_heuristic")}
     md = ["# 학습 성적표", "", "![그래프](chart.svg)", "",
           f"- 반복 **{len(hist)}회차**까지 진행",
-          f"- 기준 신경망 상대 승률: **{pc(last.get('vs_anchor'))}**  ← 이게 계속 오르면 세지는 중",
-          f"- 휴리스틱 상대 승률: **{pc(last.get('vs_heuristic'))}**",
-          f"- 무작위 상대 승률: **{pc(last.get('vs_random'))}**",
+          f"- 기준 신경망 상대 승률: **{pc(sm['vs_anchor'])}** (최근 20회차 평균, 초반 40회차는 {pc(early['vs_anchor'])})",
+          f"- 휴리스틱 상대 승률: **{pc(sm['vs_heuristic'])}** (초반 40회차는 {pc(early['vs_heuristic'])})",
+          f"- 무작위 상대 승률: {pc(sm['vs_random'])}",
           f"- 손실: 정책 {last.get('loss_policy')} / 가치 {last.get('loss_value')}",
           f"- 신경망 교체 횟수: {sum(1 for h in hist if h.get('promoted'))}회", "",
           "| 회차 | 기준망 | 휴리스틱 | 무작위 | 이전판 | 교체 | 정책손실 | 가치손실 | 초 |",
@@ -431,6 +445,8 @@ def write_report(hist):
                   f"{h.get('loss_policy')} | {h.get('loss_value')} | {h.get('sec')} |")
     md += ["", "---", "",
            "**보는 법**", "",
+           "- 위 요약과 그래프는 **20회차 이동평균**임. 한 회차 숫자는 판수가 적어서 많이 흔들린다.",
+           "- 초반 40회차 값과 비교해서 안 올랐으면 학습이 멈춘 것.",
            "- **기준 신경망 상대**가 제일 중요함. 학습 초기에 얼려 둔 신경망과 계속 붙여서, 이 승률이 꾸준히 오르면 진짜로 세지는 중임. 안 오르면 멈춘 것.",
            "- 무작위 상대는 금방 100%에 붙음. 여기서 안 오르면 파이프라인 고장.",
            "- 휴리스틱 상대는 '작은 판 딸 수 있으면 따고, 상대가 딸 자리는 막는' 단순한 봇. 이걸 넘기면 기본기는 된 것.",
@@ -438,6 +454,45 @@ def write_report(hist):
            "- 정책 손실이 회차가 가도 안 내려가면 탐색이 신경망보다 못하다는 뜻 → `sims`를 올려야 함."]
     with open(f"{STATE_DIR}/REPORT.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md))
+
+
+# ============================================================ 학습 데이터 저장/복원
+U64 = (1 << 64) - 1
+
+
+def save_buffer(buf, path):
+    if not buf:
+        return
+    n = len(buf)
+    st = np.zeros((n, 8), dtype=np.uint64)
+    pi = np.zeros((n, 81), dtype=np.float16)
+    z = np.zeros(n, dtype=np.float16)
+    for i, (s, p, v) in enumerate(buf):
+        me, op, wm, wo, wd, f = s
+        st[i] = (me & U64, me >> 64, op & U64, op >> 64, wm, wo, wd, U64 if f < 0 else f)
+        pi[i] = p
+        z[i] = v
+    tmp = path + ".tmp.npz"
+    np.savez_compressed(tmp, st=st, pi=pi, z=z)
+    os.replace(tmp, path)
+
+
+def load_buffer(path, maxlen):
+    out = deque(maxlen=maxlen)
+    if not os.path.exists(path):
+        return out
+    try:
+        d = np.load(path)
+    except Exception as e:
+        print(f"저장된 학습 데이터를 못 읽음({e}). 새로 시작.", flush=True)
+        return out
+    st, pi, z = d["st"], d["pi"], d["z"]
+    for i in range(len(z)):
+        a = [int(x) for x in st[i]]
+        f = -1 if a[7] == U64 else a[7]
+        out.append(((a[0] | (a[1] << 64), a[2] | (a[3] << 64), a[4], a[5], a[6], f),
+                    pi[i].astype(np.float64), float(z[i])))
+    return out
 
 
 # ============================================================ 본체
@@ -481,12 +536,17 @@ def run(cfg_path):
         anchor.load_state_dict(torch.load(f"{STATE_DIR}/anchor.pt", map_location="cpu"))
     anchor.eval()
 
-    buffer = deque(maxlen=cfg["buffer_size"])
+    bpath = f"{STATE_DIR}/buffer.npz"
+    buffer = load_buffer(bpath, cfg["buffer_size"])
+    if buffer:
+        print(f"저장된 학습 데이터 {len(buffer):,}개를 이어받음", flush=True)
     cpu = lambda m: {k: v.cpu() for k, v in m.state_dict().items()}
 
     while pr["iter"] < cfg["iterations"]:
         if time.time() > deadline:
-            print("시간 예산 종료. 다음 실행에서 이어감.", flush=True)
+            print("시간 예산 종료. 학습 데이터 저장 중...", flush=True)
+            save_buffer(buffer, bpath)
+            print(f"  {len(buffer):,}개 저장 완료. 다음 실행에서 이어감.", flush=True)
             break
         t0 = time.time()
         pool = lambda sds: ctx.Pool(workers, initializer=_init, initargs=(sds, cfg))
@@ -500,10 +560,11 @@ def run(cfg_path):
         lp, lv = train_net(cand, buffer, cfg)
 
         jobs, na, nt = [], cfg["arena_games"], cfg["test_games"]
+        ns = cfg.get("sanity_games", 6)          # 무작위 상대는 이미 포화라 조금만
         sd = [cpu(cand), cpu(best), cpu(anchor)]
         for i in range(na):
             jobs.append((i % 2 == 0, "net", 0, "net", 1, int(rng.integers(1 << 30))))
-        for i in range(nt):
+        for i in range(ns):
             jobs.append((i % 2 == 0, "net", 1, "random", 0, int(rng.integers(1 << 30))))
         for i in range(nt):
             jobs.append((i % 2 == 0, "net", 1, "heuristic", 0, int(rng.integers(1 << 30))))
@@ -520,9 +581,9 @@ def run(cfg_path):
             torch.save(best.state_dict(), f"{STATE_DIR}/best.pt")
         rec = {"iter": pr["iter"] + 1, "loss_policy": round(lp, 4), "loss_value": round(lv, 4),
                "vs_prev": round(wr, 3), "promoted": promoted,
-               "vs_random": round(score(res[na:na + nt]), 3),
-               "vs_heuristic": round(score(res[na + nt:na + 2 * nt]), 3),
-               "vs_anchor": round(score(res[na + 2 * nt:]), 3) if has_anchor else None,
+               "vs_random": round(score(res[na:na + ns]), 3),
+               "vs_heuristic": round(score(res[na + ns:na + ns + nt]), 3),
+               "vs_anchor": round(score(res[na + ns + nt:]), 3) if has_anchor else None,
                "buffer": len(buffer), "sec": round(time.time() - t0, 1)}
 
         if not has_anchor and pr["iter"] + 1 >= cfg.get("anchor_at", 5):
@@ -532,12 +593,15 @@ def run(cfg_path):
 
         pr["history"].append(rec); pr["iter"] += 1
         save_progress(pr); write_report(pr["history"])
+        if pr["iter"] % cfg.get("buffer_save_every", 25) == 0:
+            save_buffer(buffer, bpath)
         pc = lambda v: "-" if v is None else f"{v*100:.0f}%"
         print(f"{rec['iter']:>4}회차 손실 p={lp:.3f} v={lv:.3f} | 이전판 {pc(wr)}{' 교체' if promoted else ''}"
               f" | 무작위 {pc(rec['vs_random'])} 휴리스틱 {pc(rec['vs_heuristic'])}"
               f" 기준망 {pc(rec['vs_anchor'])} | {rec['sec']}초", flush=True)
 
     if pr["iter"] >= cfg["iterations"]:
+        save_buffer(buffer, bpath)
         with open(f"{STATE_DIR}/DONE", "w") as f:
             f.write("done\n")
         print("모든 회차 완료.", flush=True)
